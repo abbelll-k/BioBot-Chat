@@ -1,109 +1,78 @@
-import {
-  convertToModelMessages,
-  createUIMessageStream,
-  JsonToSseTransformStream,
-  smoothStream,
-  stepCountIs,
-  streamText,
-} from 'ai';
+// /app/(chat)/api/chat/route.ts
 import { auth, type UserType } from '@/app/(auth)/auth';
-import { type RequestHints, systemPrompt } from '@/lib/ai/prompts';
+import { NextResponse } from 'next/server';
+import { OpenAI } from 'openai-edge';
+import { OpenAIStream, StreamingTextResponse } from 'ai';
+import { postRequestBodySchema, type PostRequestBody } from './schema';
 import {
+  getChatById,
+  saveChat,
+  getMessagesByChatId,
+  saveMessages,
+  getMessageCountByUserId,
   createStreamId,
   deleteChatById,
-  getChatById,
-  getMessageCountByUserId,
-  getMessagesByChatId,
-  saveChat,
-  saveMessages,
 } from '@/lib/db/queries';
-import { convertToUIMessages, generateUUID } from '@/lib/utils';
+import { generateUUID } from '@/lib/utils';
 import { generateTitleFromUserMessage } from '@/app/(chat)/actions';
-import { createDocument } from '@/lib/ai/tools/create-document';
-import { updateDocument } from '@/lib/ai/tools/update-document';
-import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
-import { getWeather } from '@/lib/ai/tools/get-weather';
-import { isProductionEnvironment } from '@/lib/constants';
-import { myProvider } from '@/lib/ai/providers';
-import { entitlementsByUserType } from '@/lib/ai/entitlements';
-import { postRequestBodySchema, type PostRequestBody } from './schema';
-import { geolocation } from '@vercel/functions';
-import {
-  createResumableStreamContext,
-  type ResumableStreamContext,
-} from 'resumable-stream';
-import { after } from 'next/server';
-import { ChatSDKError } from '@/lib/errors';
 import type { ChatMessage } from '@/lib/types';
-import type { ChatModel } from '@/lib/ai/models';
-import type { VisibilityType } from '@/components/visibility-selector';
 
-export const maxDuration = 60;
-let globalStreamContext: ResumableStreamContext | null = null;
-function getStreamContext() {
-  if (!globalStreamContext) {
-    try {
-      globalStreamContext = createResumableStreamContext({ waitUntil: after });
-    } catch (err: any) {
-      if (!err.message.includes('REDIS_URL')) console.error(err);
-    }
-  }
-  return globalStreamContext;
-}
+export const runtime = 'edge';
 
 export async function POST(request: Request) {
-  let requestBody: PostRequestBody;
-  try {
-    requestBody = postRequestBodySchema.parse(await request.json());
-  } catch {
-    return new ChatSDKError('bad_request:api').toResponse();
+  // 1) AUTH
+  const session = await auth();
+  if (!session?.user) {
+    return new NextResponse('Unauthorized', { status: 401 });
   }
 
-  const {
-    id,
-    message,
-    selectedChatModel,
-    selectedVisibilityType,
-  } = requestBody;
-  const session = await auth();
-  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
+  // 2) PARSE & VALIDATE BODY
+  let body: PostRequestBody;
+  try {
+    body = postRequestBodySchema.parse(await request.json());
+  } catch {
+    return new NextResponse('Bad Request', { status: 400 });
+  }
+  const { id: chatId, message, selectedChatModel } = body;
 
-  // rate‐limit
-  const count = await getMessageCountByUserId({
+  // 3) RATE-LIMIT by user type
+  const usedIn24h = await getMessageCountByUserId({
     id: session.user.id,
     differenceInHours: 24,
   });
-  if (count > entitlementsByUserType[session.user.type].maxMessagesPerDay) {
-    return new ChatSDKError('rate_limit:chat').toResponse();
+  const maxPerDay = {
+    guest: 100,
+    user: 1000,
+  }[session.user.type as UserType];
+  if (usedIn24h >= maxPerDay) {
+    return new NextResponse('Rate limit exceeded', { status: 429 });
   }
 
-  // ensure chat exists
-  const chat = await getChatById({ id });
-  if (!chat) {
+  // 4) ENSURE CHAT EXISTS (and create with title for first message)
+  const existing = await getChatById({ id: chatId });
+  if (!existing) {
     const title = await generateTitleFromUserMessage({ message });
     await saveChat({
-      id,
+      id: chatId,
       userId: session.user.id,
       title,
-      visibility: selectedVisibilityType,
+      visibility: 'private',
     });
-  } else if (chat.userId !== session.user.id) {
-    return new ChatSDKError('forbidden:chat').toResponse();
+  } else if (existing.userId !== session.user.id) {
+    return new NextResponse('Forbidden', { status: 403 });
   }
 
-  // fetch history + geolocation hints
-  const history = await getMessagesByChatId({ id });
-  const uiHistory = [...convertToUIMessages(history), message];
-  const { longitude, latitude, city, country } = geolocation(request);
-  const requestHints: RequestHints = { longitude, latitude, city, country };
+  // 5) LOAD HISTORY, APPEND USER MESSAGE
+  const history = await getMessagesByChatId({ id: chatId });
+  const messages: ChatMessage[] = [...history, message];
 
-  // persist user message
+  // 6) PERSIST THE USER MESSAGE
   await saveMessages({
     messages: [
       {
-        chatId: id,
+        chatId,
         id: message.id,
-        role: 'user',
+        role: message.role,
         parts: message.parts,
         attachments: [],
         createdAt: new Date(),
@@ -111,60 +80,44 @@ export async function POST(request: Request) {
     ],
   });
 
-  // create stream ID
+  // 7) CREATE A STREAM ID FOR RESUMABLE (optional)
   const streamId = generateUUID();
-  await createStreamId({ streamId, chatId: id });
+  await createStreamId({ streamId, chatId });
 
-  // build the AI stream
-  const result = streamText({
-    model: myProvider.languageModel(selectedChatModel),
-    system: systemPrompt({
-      selectedChatModel,
-      requestHints,          // <— fixed: pass both props
-    }),
-    messages: convertToModelMessages(uiHistory),
-    stopWhen: stepCountIs(5),
-    experimental_activeTools:
-      selectedChatModel === 'chat-model-reasoning'
-        ? []
-        : ['getWeather', 'createDocument', 'updateDocument', 'requestSuggestions'],
-    tools: {
-      getWeather,
-      createDocument: createDocument({ session, dataStream: () => {} }),
-      updateDocument: updateDocument({ session, dataStream: () => {} }),
-      requestSuggestions: requestSuggestions({ session, dataStream: () => {} }),
-    },
-    experimental_transform: smoothStream({ chunking: 'word' }),
-    experimental_telemetry: {
-      isEnabled: isProductionEnvironment,
-      functionId: 'stream-text',
-    },
-  });
+  // 8) CALL OPENAI-EDGE + AI-SDK STREAM WRAP
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+  const aiStream = await OpenAIStream(
+    openai.chat.completions.create({
+      model: selectedChatModel,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.parts.map((p) => p.text).join(''),
+      })),
+      stream: true,
+    })
+  );
 
-  // hook up to resumable context
-  const streamContext = getStreamContext();
-  const sse = await (streamContext
-    ? streamContext.resumableStream(streamId, () =>
-        result.pipeThrough(new JsonToSseTransformStream())
-      )
-    : result.pipeThrough(new JsonToSseTransformStream()));
-
-  return new Response(sse, { status: 200 });
+  // 9) RETURN A STREAMING RESPONSE
+  return new StreamingTextResponse(aiStream);
 }
 
 export async function DELETE(request: Request) {
   const url = new URL(request.url);
-  const id = url.searchParams.get('id')!;
-  if (!id) return new ChatSDKError('bad_request:api').toResponse();
-
-  const session = await auth();
-  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
-
-  const chat = await getChatById({ id });
-  if (chat.userId !== session.user.id) {
-    return new ChatSDKError('forbidden:chat').toResponse();
+  const chatId = url.searchParams.get('id');
+  if (!chatId) {
+    return new NextResponse('Bad Request', { status: 400 });
   }
 
-  const deleted = await deleteChatById({ id });
-  return Response.json(deleted, { status: 200 });
+  const session = await auth();
+  if (!session?.user) {
+    return new NextResponse('Unauthorized', { status: 401 });
+  }
+
+  const chat = await getChatById({ id: chatId });
+  if (!chat || chat.userId !== session.user.id) {
+    return new NextResponse('Forbidden', { status: 403 });
+  }
+
+  await deleteChatById({ id: chatId });
+  return NextResponse.json({ success: true });
 }
