@@ -39,7 +39,6 @@ import type { ChatMessage } from '@/lib/types';
 import type { VisibilityType } from '@/components/visibility-selector';
 
 export const maxDuration = 60;
-
 let globalStreamContext: ResumableStreamContext | null = null;
 export function getStreamContext() {
   if (!globalStreamContext) {
@@ -57,7 +56,7 @@ export function getStreamContext() {
 }
 
 export async function POST(request: Request) {
-  // 1) validate & parse
+  // 1) Parse & validate
   let body: PostRequestBody;
   try {
     body = postRequestBodySchema.parse(await request.json());
@@ -65,14 +64,12 @@ export async function POST(request: Request) {
     return new ChatSDKError('bad_request:api').toResponse();
   }
 
-  // 2) force GPT-4o
-  const forcedModelId = 'gpt-4o';
+  // 2) Force the fastest model
+  const forcedModel = 'gpt-4o';
 
-  // 3) auth & rate-limit
+  // 3) Auth & rate‐limit
   const session = await auth();
-  if (!session?.user) {
-    return new ChatSDKError('unauthorized:chat').toResponse();
-  }
+  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
   const userType: UserType = session.user.type;
   const count = await getMessageCountByUserId({
     id: session.user.id,
@@ -82,7 +79,7 @@ export async function POST(request: Request) {
     return new ChatSDKError('rate_limit:chat').toResponse();
   }
 
-  // 4) create or verify chat
+  // 4) Create or verify chat
   const chat = await getChatById({ id: body.id });
   if (!chat) {
     const title = await generateTitleFromUserMessage({ message: body.message });
@@ -96,11 +93,11 @@ export async function POST(request: Request) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
 
-  // 5) load history + append user
-  const fromDb = await getMessagesByChatId({ id: body.id });
-  const uiMessages = [...convertToUIMessages(fromDb), body.message];
+  // 5) Load history + append user message
+  const history = await getMessagesByChatId({ id: body.id });
+  const uiMessages = [...convertToUIMessages(history), body.message];
 
-  // 6) persist user message
+  // 6) Persist user message
   await saveMessages({
     messages: [
       {
@@ -114,7 +111,7 @@ export async function POST(request: Request) {
     ],
   });
 
-  // 7) build stream
+  // 7) Prepare streaming
   const { longitude, latitude, city, country } = geolocation(request);
   const hints: RequestHints = { longitude, latitude, city, country };
   const streamId = generateUUID();
@@ -123,8 +120,8 @@ export async function POST(request: Request) {
   const stream = createUIMessageStream({
     execute: ({ writer }) => {
       const result = streamText({
-        model: myProvider.languageModel(forcedModelId),
-        system: systemPrompt({ selectedChatModel: forcedModelId, requestHints: hints }),
+        model: myProvider.languageModel(forcedModel),
+        system: systemPrompt({ selectedChatModel: forcedModel, requestHints: hints }),
         messages: convertToModelMessages(uiMessages),
         stopWhen: stepCountIs(5),
         experimental_activeTools: [
@@ -165,7 +162,7 @@ export async function POST(request: Request) {
     onError: () => 'Oops, something went wrong.',
   });
 
-  // 8) return SSE (resumable if possible)
+  // 8) Return SSE (resumable if possible)
   const ctx = getStreamContext();
   if (ctx) {
     return new Response(
@@ -183,17 +180,14 @@ export async function DELETE(request: Request) {
   if (!id) {
     return new ChatSDKError('bad_request:api').toResponse();
   }
-
   const session = await auth();
   if (!session?.user) {
     return new ChatSDKError('unauthorized:chat').toResponse();
   }
-
   const chat = await getChatById({ id });
   if (chat.userId !== session.user.id) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
-
   const deleted = await deleteChatById({ id });
   return Response.json(deleted, { status: 200 });
 }
