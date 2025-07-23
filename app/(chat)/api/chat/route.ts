@@ -5,7 +5,7 @@ import { getChatById } from '@/lib/db/queries';
 import { convertToModelMessages } from '@/lib/utils';
 import { ChatSDKError } from '@/lib/errors';
 
-export const runtime = 'edge'; // or 'nodejs' if you prefer
+export const runtime = 'nodejs'; // or 'nodejs' if you prefer
 
 export async function POST(request: NextRequest) {
   // 1) Make sure we have our key
