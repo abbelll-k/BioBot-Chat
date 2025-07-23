@@ -1,123 +1,55 @@
-// /app/(chat)/api/chat/route.ts
-import { auth, type UserType } from '@/app/(auth)/auth';
-import { NextResponse } from 'next/server';
-import { OpenAI } from 'openai-edge';
-import { OpenAIStream, StreamingTextResponse } from 'ai';
-import { postRequestBodySchema, type PostRequestBody } from './schema';
-import {
-  getChatById,
-  saveChat,
-  getMessagesByChatId,
-  saveMessages,
-  getMessageCountByUserId,
-  createStreamId,
-  deleteChatById,
-} from '@/lib/db/queries';
-import { generateUUID } from '@/lib/utils';
-import { generateTitleFromUserMessage } from '@/app/(chat)/actions';
-import type { ChatMessage } from '@/lib/types';
+// app/(chat)/api/chat/route.ts
+import { createUIMessageStream, JsonToSseTransformStream } from 'ai';
 
 export const runtime = 'edge';
 
 export async function POST(request: Request) {
-  // 1) AUTH
-  const session = await auth();
-  if (!session?.user) {
-    return new NextResponse('Unauthorized', { status: 401 });
-  }
-
-  // 2) PARSE & VALIDATE BODY
-  let body: PostRequestBody;
+  // 1) parse the incoming JSON
+  let body: { prompt?: string };
   try {
-    body = postRequestBodySchema.parse(await request.json());
+    body = await request.json();
   } catch {
-    return new NextResponse('Bad Request', { status: 400 });
-  }
-  const { id: chatId, message, selectedChatModel } = body;
-
-  // 3) RATE-LIMIT by user type
-  const usedIn24h = await getMessageCountByUserId({
-    id: session.user.id,
-    differenceInHours: 24,
-  });
-  const maxPerDay = {
-    guest: 100,
-    user: 1000,
-  }[session.user.type as UserType];
-  if (usedIn24h >= maxPerDay) {
-    return new NextResponse('Rate limit exceeded', { status: 429 });
+    return new Response('Invalid JSON', { status: 400 });
   }
 
-  // 4) ENSURE CHAT EXISTS (and create with title for first message)
-  const existing = await getChatById({ id: chatId });
-  if (!existing) {
-    const title = await generateTitleFromUserMessage({ message });
-    await saveChat({
-      id: chatId,
-      userId: session.user.id,
-      title,
-      visibility: 'private',
-    });
-  } else if (existing.userId !== session.user.id) {
-    return new NextResponse('Forbidden', { status: 403 });
+  const prompt = body.prompt?.trim();
+  if (!prompt) {
+    return new Response('Missing "prompt" field', { status: 400 });
   }
 
-  // 5) LOAD HISTORY, APPEND USER MESSAGE
-  const history = await getMessagesByChatId({ id: chatId });
-  const messages: ChatMessage[] = [...history, message];
-
-  // 6) PERSIST THE USER MESSAGE
-  await saveMessages({
-    messages: [
-      {
-        chatId,
-        id: message.id,
-        role: message.role,
-        parts: message.parts,
-        attachments: [],
-        createdAt: new Date(),
-      },
-    ],
+  // 2) build a tiny streaming response
+  const stream = createUIMessageStream({
+    execute: ({ writer }) => {
+      // you can split this up however you like to simulate streaming
+      writer.write({
+        role: 'assistant',
+        parts: [{ type: 'text', text: `You said: ` }],
+      });
+      for (const word of prompt.split(' ')) {
+        writer.write({
+          role: 'assistant',
+          parts: [{ type: 'text', text: word + ' ' }],
+        });
+      }
+      writer.write({
+        role: 'assistant',
+        parts: [{ type: 'text', text: `🎉` }],
+      });
+    },
   });
 
-  // 7) CREATE A STREAM ID FOR RESUMABLE (optional)
-  const streamId = generateUUID();
-  await createStreamId({ streamId, chatId });
-
-  // 8) CALL OPENAI-EDGE + AI-SDK STREAM WRAP
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-  const aiStream = await OpenAIStream(
-    openai.chat.completions.create({
-      model: selectedChatModel,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.parts.map((p) => p.text).join(''),
-      })),
-      stream: true,
-    })
-  );
-
-  // 9) RETURN A STREAMING RESPONSE
-  return new StreamingTextResponse(aiStream);
+  // 3) wrap it in SSE and return
+  return new Response(stream.pipeThrough(new JsonToSseTransformStream()), {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      // recommended for SSE
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    },
+  });
 }
 
-export async function DELETE(request: Request) {
-  const url = new URL(request.url);
-  const chatId = url.searchParams.get('id');
-  if (!chatId) {
-    return new NextResponse('Bad Request', { status: 400 });
-  }
-
-  const session = await auth();
-  if (!session?.user) {
-    return new NextResponse('Unauthorized', { status: 401 });
-  }
-
-  const chat = await getChatById({ id: chatId });
-  if (!chat || chat.userId !== session.user.id) {
-    return new NextResponse('Forbidden', { status: 403 });
-  }
-
-  await deleteChatById({ id: chatId });
-  return NextResponse.json({ success: true });
+export async function DELETE() {
+  // a no-op delete so your front end can still call DELETE
+  return new Response(null, { status: 204 });
 }
