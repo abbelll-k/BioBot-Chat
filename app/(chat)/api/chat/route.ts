@@ -1,7 +1,6 @@
-// Tell Next to run this in Node.js (so you can import postgres, crypto, etc)
+// /app/(chat)/api/chat/route.ts
 export const runtime = 'nodejs';
 
-import { auth } from '@/app/(auth)/auth';
 import {
   convertToModelMessages,
   createUIMessageStream,
@@ -10,9 +9,8 @@ import {
   stepCountIs,
   streamText,
 } from 'ai';
-import type { ChatMessage } from '@/lib/types';
-import type { ChatModel } from '@/lib/ai/models';
-import type { VisibilityType } from '@/components/visibility-selector';
+import { auth, type UserType } from '@/app/(auth)/auth';
+import { type RequestHints, systemPrompt } from '@/lib/ai/prompts';
 import {
   createStreamId,
   deleteChatById,
@@ -22,17 +20,15 @@ import {
   saveChat,
   saveMessages,
 } from '@/lib/db/queries';
-import { generateUUID } from '@/lib/utils';
-import { systemPrompt, type RequestHints } from '@/lib/ai/prompts';
-import {
-  createDocument,
-  updateDocument,
-  requestSuggestions,
-  getWeather,
-} from '@/lib/ai/tools';
+import { convertToUIMessages, generateUUID } from '@/lib/utils';
+import { generateTitleFromUserMessage } from './actions';
+import { createDocument } from '@/lib/ai/tools/create-document';
+import { updateDocument } from '@/lib/ai/tools/update-document';
+import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
+import { getWeather } from '@/lib/ai/tools/get-weather';
+import { isProductionEnvironment } from '@/lib/constants';
 import { myProvider } from '@/lib/ai/providers';
 import { entitlementsByUserType } from '@/lib/ai/entitlements';
-import { isProductionEnvironment } from '@/lib/constants';
 import { postRequestBodySchema, type PostRequestBody } from './schema';
 import { geolocation } from '@vercel/functions';
 import {
@@ -41,45 +37,37 @@ import {
 } from 'resumable-stream';
 import { after } from 'next/server';
 import { ChatSDKError } from '@/lib/errors';
-
-// max minutes before giving up on a live stream
-export const maxDuration = 60;
-
-let globalStreamContext: ResumableStreamContext | null = null;
-function getStreamContext() {
-  if (!globalStreamContext) {
-    try {
-      globalStreamContext = createResumableStreamContext({ waitUntil: after });
-    } catch (e: any) {
-      // if you didn’t set REDIS_URL it’ll disable resumable streams gracefully
-    }
-  }
-  return globalStreamContext;
-}
+import type { ChatMessage } from '@/lib/types';
+import type { ChatModel } from '@/lib/ai/models';
+import type { VisibilityType } from '@/components/visibility-selector';
 
 export async function POST(request: Request) {
-  // 1) parse + validate
+  // 1) Parse + validate the body
   let body: PostRequestBody;
   try {
-    body = postRequestBodySchema.parse(await request.json());
+    const json = await request.json();
+    body = postRequestBodySchema.parse(json);
   } catch {
     return new ChatSDKError('bad_request:api').toResponse();
   }
 
   const { id, message, selectedChatModel, selectedVisibilityType } = body;
   const session = await auth();
-  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
+  if (!session?.user) {
+    return new ChatSDKError('unauthorized:chat').toResponse();
+  }
+  const userType: UserType = session.user.type;
 
-  // 2) rate‐limit
+  // 2) Rate-limit by user type
   const count = await getMessageCountByUserId({
     id: session.user.id,
     differenceInHours: 24,
   });
-  if (count > entitlementsByUserType[session.user.type].maxMessagesPerDay) {
+  if (count > entitlementsByUserType[userType].maxMessagesPerDay) {
     return new ChatSDKError('rate_limit:chat').toResponse();
   }
 
-  // 3) ensure chat exists (or create it)
+  // 3) Create or verify chat exists
   const existing = await getChatById({ id });
   if (!existing) {
     const title = await generateTitleFromUserMessage({ message });
@@ -93,7 +81,9 @@ export async function POST(request: Request) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
 
-  // 4) persist user’s new message
+  // 4) Pull history + append the new user message
+  const history = await getMessagesByChatId({ id });
+  const uiHistory = [...convertToUIMessages(history), message];
   await saveMessages({
     messages: [
       {
@@ -107,37 +97,48 @@ export async function POST(request: Request) {
     ],
   });
 
-  // 5) stream setup
+  // 5) Wire up a resumable stream
   const streamId = generateUUID();
   await createStreamId({ streamId, chatId: id });
-  const uiHistory = [
-    ...convertToUIMessages(await getMessagesByChatId({ id })),
-    message,
-  ];
-  const ctx = getStreamContext();
+  let globalCtx: ResumableStreamContext | null = null;
+  try {
+    globalCtx = createResumableStreamContext({ waitUntil: after });
+  } catch (e: any) {
+    if (!e.message.includes('REDIS_URL')) throw e;
+    console.warn('No Redis → resumable streams disabled');
+  }
 
-  const stream = createUIMessageStream({
+  const aiStream = createUIMessageStream<ChatMessage>({
     execute: ({ writer: dataStream }) => {
       const result = streamText({
         model: myProvider.languageModel(selectedChatModel),
-        system: systemPrompt({ selectedChatModel, requestHints: geolocation(request) }),
+        system: systemPrompt({
+          selectedChatModel,
+          longitude: geolocation(request).longitude,
+          latitude: geolocation(request).latitude,
+          city: geolocation(request).city,
+          country: geolocation(request).country,
+        } as RequestHints),
         messages: convertToModelMessages(uiHistory),
         stopWhen: stepCountIs(5),
         experimental_activeTools:
           selectedChatModel === 'chat-model-reasoning'
             ? []
             : ['getWeather', 'createDocument', 'updateDocument', 'requestSuggestions'],
-        tools: { getWeather, createDocument: createDocument({ session, dataStream }), updateDocument: updateDocument({ session, dataStream }), requestSuggestions: requestSuggestions({ session, dataStream }) },
         experimental_transform: smoothStream({ chunking: 'word' }),
+        tools: {
+          getWeather,
+          createDocument: createDocument({ session, dataStream }),
+          updateDocument: updateDocument({ session, dataStream }),
+          requestSuggestions: requestSuggestions({ session, dataStream }),
+        },
         experimental_telemetry: {
           isEnabled: isProductionEnvironment,
           functionId: 'stream-text',
         },
       });
       result.consumeStream();
-      dataStream.merge(
-        result.toUIMessageStream({ sendReasoning: true })
-      );
+      dataStream.merge(result.toUIMessageStream({ sendReasoning: true }));
     },
     generateId: generateUUID,
     onFinish: async ({ messages }) => {
@@ -146,21 +147,27 @@ export async function POST(request: Request) {
           id: m.id,
           role: m.role,
           parts: m.parts,
-          createdAt: new Date(),
           attachments: [],
+          createdAt: new Date(),
           chatId: id,
         })),
       });
     },
-    onError: () => 'Oops, something went wrong.',
+    onError: (e) => {
+      console.error(e);
+      return 'Oops, something went wrong.';
+    },
   });
 
-  if (ctx) {
-    return new Response(
-      await ctx.resumableStream(streamId, () =>
-        stream.pipeThrough(new JsonToSseTransformStream())
+  const responder = globalCtx
+    ? await globalCtx.resumableStream(streamId, () =>
+        aiStream.pipeThrough(new JsonToSseTransformStream())
       )
-    );
-  }
-  return new Response(stream.pipeThrough(new JsonToSseTransformStream()));
+    : aiStream.pipeThrough(new JsonToSseTransformStream());
+
+  // 6) Return the streaming response
+  return new Response(responder, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
 }
