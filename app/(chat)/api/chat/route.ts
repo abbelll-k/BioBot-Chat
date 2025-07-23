@@ -29,31 +29,11 @@ import { myProvider } from '@/lib/ai/providers';
 import { entitlementsByUserType } from '@/lib/ai/entitlements';
 import { postRequestBodySchema, type PostRequestBody } from '@/app/(chat)/api/chat/schema';
 import { geolocation } from '@vercel/functions';
-import {
-  createResumableStreamContext,
-  type ResumableStreamContext,
-} from 'resumable-stream';
-import { after } from 'next/server';
 import { ChatSDKError } from '@/lib/errors';
 import type { ChatMessage } from '@/lib/types';
 import type { VisibilityType } from '@/components/visibility-selector';
 
 export const maxDuration = 60;
-let globalStreamContext: ResumableStreamContext | null = null;
-export function getStreamContext() {
-  if (!globalStreamContext) {
-    try {
-      globalStreamContext = createResumableStreamContext({ waitUntil: after });
-    } catch (e: any) {
-      if (e.message.includes('REDIS_URL')) {
-        console.log('> Resumable streams disabled (no REDIS_URL)');
-      } else {
-        console.error(e);
-      }
-    }
-  }
-  return globalStreamContext;
-}
 
 export async function POST(request: Request) {
   // 1) Parse & validate
@@ -64,12 +44,14 @@ export async function POST(request: Request) {
     return new ChatSDKError('bad_request:api').toResponse();
   }
 
-  // 2) Force the fastest model
+  // 2) Force GPT-4o
   const forcedModel = 'gpt-4o';
 
-  // 3) Auth & rate‐limit
+  // 3) Auth & rate-limit
   const session = await auth();
-  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
+  if (!session?.user) {
+    return new ChatSDKError('unauthorized:chat').toResponse();
+  }
   const userType: UserType = session.user.type;
   const count = await getMessageCountByUserId({
     id: session.user.id,
@@ -93,7 +75,7 @@ export async function POST(request: Request) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
 
-  // 5) Load history + append user message
+  // 5) Load history + append user
   const history = await getMessagesByChatId({ id: body.id });
   const uiMessages = [...convertToUIMessages(history), body.message];
 
@@ -111,11 +93,9 @@ export async function POST(request: Request) {
     ],
   });
 
-  // 7) Prepare streaming
+  // 7) Build the streaming pipeline
   const { longitude, latitude, city, country } = geolocation(request);
   const hints: RequestHints = { longitude, latitude, city, country };
-  const streamId = generateUUID();
-  await createStreamId({ streamId, chatId: body.id });
 
   const stream = createUIMessageStream({
     execute: ({ writer }) => {
@@ -162,16 +142,11 @@ export async function POST(request: Request) {
     onError: () => 'Oops, something went wrong.',
   });
 
-  // 8) Return SSE (resumable if possible)
-  const ctx = getStreamContext();
-  if (ctx) {
-    return new Response(
-      await ctx.resumableStream(streamId, () =>
-        stream.pipeThrough(new JsonToSseTransformStream())
-      )
-    );
-  }
-  return new Response(stream.pipeThrough(new JsonToSseTransformStream()));
+  // 8) Return a plain SSE response immediately
+  const sseStream = stream.pipeThrough(new JsonToSseTransformStream());
+  return new Response(sseStream, {
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
 }
 
 export async function DELETE(request: Request) {
