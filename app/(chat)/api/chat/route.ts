@@ -1,48 +1,64 @@
 // app/(chat)/api/chat/route.ts
-import { createUIMessageStream, JsonToSseTransformStream } from 'ai';
-
 export const runtime = 'edge';
 
+interface ChatRequest {
+  prompt?: string;
+}
+
 export async function POST(request: Request) {
-  // 1) parse the incoming JSON
-  let body: { prompt?: string };
+  // 1) Parse JSON body
+  let body: ChatRequest;
   try {
-    body = await request.json();
+    body = (await request.json()) as ChatRequest;
   } catch {
-    return new Response('Invalid JSON', { status: 400 });
+    return new Response(
+      JSON.stringify({ error: 'Invalid JSON' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 
   const prompt = body.prompt?.trim();
   if (!prompt) {
-    return new Response('Missing "prompt" field', { status: 400 });
+    return new Response(
+      JSON.stringify({ error: 'Missing `prompt` field' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 
-  // 2) build a tiny streaming response
-  const stream = createUIMessageStream({
-    execute: ({ writer }) => {
-      // you can split this up however you like to simulate streaming
-      writer.write({
-        role: 'assistant',
-        parts: [{ type: 'text', text: `You said: ` }],
-      });
-      for (const word of prompt.split(' ')) {
-        writer.write({
-          role: 'assistant',
-          parts: [{ type: 'text', text: word + ' ' }],
-        });
-      }
-      writer.write({
-        role: 'assistant',
-        parts: [{ type: 'text', text: `🎉` }],
-      });
-    },
-  });
+  // 2) Fetch a streaming ChatCompletion from OpenAI
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    return new Response(
+      JSON.stringify({ error: 'OpenAI API key not configured' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
 
-  // 3) wrap it in SSE and return
-  return new Response(stream.pipeThrough(new JsonToSseTransformStream()), {
+  const openaiRes = await fetch(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',           // ← or whatever model you want
+        messages: [{ role: 'user', content: prompt }],
+        stream: true,
+      }),
+    }
+  );
+
+  if (!openaiRes.ok || !openaiRes.body) {
+    const errText = await openaiRes.text();
+    return new Response(errText, { status: openaiRes.status });
+  }
+
+  // 3) Proxy the raw event-stream back to the client
+  return new Response(openaiRes.body, {
     headers: {
       'Content-Type': 'text/event-stream',
-      // recommended for SSE
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
     },
@@ -50,6 +66,6 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE() {
-  // a no-op delete so your front end can still call DELETE
+  // still satisfy your front-end's DELETE call
   return new Response(null, { status: 204 });
 }
