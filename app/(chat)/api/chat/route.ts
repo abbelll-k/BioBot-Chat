@@ -20,8 +20,8 @@ import {
   saveMessages,
 } from '@/lib/db/queries';
 import { convertToUIMessages, generateUUID } from '@/lib/utils';
-// ⬇️ FIXED import path here:
-import { generateTitleFromUserMessage } from '../../actions'; 
+// — fixed import path:
+import { generateTitleFromUserMessage } from '../../actions';
 import { createDocument } from '@/lib/ai/tools/create-document';
 import { updateDocument } from '@/lib/ai/tools/update-document';
 import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
@@ -41,34 +41,34 @@ import type { ChatMessage } from '@/lib/types';
 import type { ChatModel } from '@/lib/ai/models';
 
 export async function POST(request: Request) {
-  // 1) Validate body
+  // 1️⃣ Parse & validate JSON body
   let body: PostRequestBody;
   try {
-    const json = await request.json();
-    body = postRequestBodySchema.parse(json);
+    body = postRequestBodySchema.parse(await request.json());
   } catch {
     return new ChatSDKError('bad_request:api').toResponse();
   }
-
   const { id, message, selectedChatModel, selectedVisibilityType } = body;
+
+  // 2️⃣ Authenticate
   const session = await auth();
   if (!session?.user) {
     return new ChatSDKError('unauthorized:chat').toResponse();
   }
   const userType: UserType = session.user.type;
 
-  // 2) Rate-limit
-  const count = await getChatById({ id: session.user.id, differenceInHours: 24 })
-    .then(() => getMessageCountByUserId({ id: session.user.id, differenceInHours: 24 }))
-    .catch(() => 0);
-
-  if (count > entitlementsByUserType[userType].maxMessagesPerDay) {
+  // 3️⃣ Rate-limit: count messages in last 24h
+  const messageCount = await getMessageCountByUserId({
+    id: session.user.id,
+    differenceInHours: 24,
+  });
+  if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
     return new ChatSDKError('rate_limit:chat').toResponse();
   }
 
-  // 3) Create or verify chat
-  const existing = await getChatById({ id });
-  if (!existing) {
+  // 4️⃣ Create or verify chat record
+  const existingChat = await getChatById({ id });
+  if (!existingChat) {
     const title = await generateTitleFromUserMessage({ message });
     await saveChat({
       id,
@@ -76,11 +76,11 @@ export async function POST(request: Request) {
       title,
       visibility: selectedVisibilityType,
     });
-  } else if (existing.userId !== session.user.id) {
+  } else if (existingChat.userId !== session.user.id) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
 
-  // 4) Append user message to history
+  // 5️⃣ Append the user’s message to the DB
   const history = await getMessagesByChatId({ id });
   const uiHistory = [...convertToUIMessages(history), message];
   await saveMessages({
@@ -96,19 +96,20 @@ export async function POST(request: Request) {
     ],
   });
 
-  // 5) Create a resumable stream ID
+  // 6️⃣ Reserve a stream ID for this response
   const streamId = generateUUID();
-  await createStreamId({ streamId, chatId: id });
+  await createStreamId({ chatId: id, streamId });
 
-  // 6) Wire up the AI stream
+  // 7️⃣ Initialize resumable‐stream context
   let globalCtx: ResumableStreamContext | null = null;
   try {
     globalCtx = createResumableStreamContext({ waitUntil: after });
   } catch (e: any) {
     if (!e.message.includes('REDIS_URL')) throw e;
-    console.warn('Resumable streams disabled (no REDIS_URL)');
+    console.warn('Resumable streams disabled (missing REDIS_URL)');
   }
 
+  // 8️⃣ Build the AI‐response stream
   const aiStream = createUIMessageStream<ChatMessage>({
     execute: ({ writer: ds }) => {
       const result = streamText({
@@ -154,10 +155,10 @@ export async function POST(request: Request) {
         })),
       });
     },
-    onError: () => 'An error occurred while streaming.',
+    onError: () => 'An error occurred.',
   });
 
-  // 7) Return the SSE stream
+  // 9️⃣ Return the SSE stream (resumable if Redis is configured)
   const responseStream = globalCtx
     ? await globalCtx.resumableStream(streamId, () =>
         aiStream.pipeThrough(new JsonToSseTransformStream())
